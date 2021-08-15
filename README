@@ -1,0 +1,21 @@
+dapr init
+----------------------------------------------------------------------------------------------------------------------
+curl -X POST -H "Content-Type: application/json" -d '[{ "key": "name", "value": "Bruce Wayne"}]' http://localhost:3500/v1.0/state/statestore
+curl http://localhost:3500/v1.0/state/statestore/name
+----------------------------------------------------------------------------------------------------------------------
+RUN APPLICATION
+
+#messenger dir
+dapr run --app-id messenger -d ~/www/dapr/components --dapr-http-port 3500 -- go run ./main.go
+
+#statistics dir
+dapr run --app-id statistics -d ~/www/dapr/components -- go run ./server.go
+dapr run --app-id statistics-subscriber -d ~/www/dapr/components -- go run ./subscriber.go
+
+----------------------------------------------------------------------------------------------------------------------
+SEND EVENT
+curl -XPOST http://localhost:3500/v1.0/publish/pubsub/statistics
+
+curl -X POST http://localhost:3500/v1.0/publish/pubsub/newOrder \
+  -H "Content-Type: application/json" \
+  -d '{ "orderId": "1234", "productId": "5678", "amount": 2 }'

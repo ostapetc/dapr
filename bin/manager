@@ -1,0 +1,1196 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o pipefail
+set -o nounset
+# set -x
+
+DOCKER_NETWORK_NAME=stripchat
+DOCKER_NETWORK_SUBNET=172.16.2.0/24
+
+DOCKER_COMPOSE_DEV="docker-compose -f docker-compose.yml -f docker-compose.override.yml"
+DOCKER_COMPOSE_GITLAB_TEST="docker-compose -f tests/docker-compose.backend-tests.gitlab-runner.yml"
+DOCKER_COMPOSE_ACCEPTANCE="docker-compose -f tests/docker-compose.yml -f tests/docker-compose.acceptance.yml"
+DOCKER_COMPOSE_ACCEPTANCE_DEV="$DOCKER_COMPOSE_ACCEPTANCE -f tests/docker-compose.acceptance.dev.yml -f tests/docker-compose.selenoid.dev.yml"
+DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK="$DOCKER_COMPOSE_ACCEPTANCE -f tests/docker-compose.acceptance.openstack.yml"
+DOCKER_COMPOSE_INTEGRATION_OPENSTACK="docker-compose -f tests/docker-compose.validation.openstack.yml"
+DOCKER_COMPOSE_PAYMENTICO="docker-compose -f ./docker/paymentico/docker-compose.yml"
+DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO="docker-compose -f ./docker/paymentico/docker-compose.acceptance.yml"
+# Use $DOCKER_COMPOSE_DEV by default
+DOCKER_COMPOSE_CURRENT=$DOCKER_COMPOSE_DEV
+
+GITLAB_USER="gitlab+deploy-token-9"
+GITLAB_PWD="DhdukLp-wu1zyLGWR8s5"
+
+main() {
+    case "${1:-}" in
+        up) up "${2:-}";;
+        down) down "${2:-}";;
+        restart) restart "${2:-}";;
+
+        acceptance-local-restart) acceptance-local-restart ${2-};;
+        acceptance-up) acceptance-up;;
+        acceptance-down) acceptance-down;;
+        openstack-up) openstack-up ${2-};;
+        openstack-down) openstack-down;;
+        upload-results-to-allure) upload-results-to-allure ${2-};;
+
+        composer) composer;;
+        frontend-build) frontend-build;;
+        frontend-build-acceptance) frontend-build-acceptance;;
+        frontend-build-acceptance-new) frontend-build-acceptance-new;;
+        frontend-admin-build-acceptance) frontend-admin-build-acceptance;;
+        frontend-build-with-legacy) frontend-build-with-legacy;;
+        frontend-admin-build) frontend-admin-build;;
+        docs) docs;;
+        rebuild) rebuild;;
+
+        migrations) migrations;;
+        fixtures) fixtures;;
+
+        worker-start) worker-start "${2:-}";;
+        worker-stop) worker-stop "${2:-}";;
+        worker-restart) worker-restart "${2:-}";;
+        min-workers-suite) min-workers-suite;;
+        start-workers) start-all-workers;;
+        scheduler) scheduler;;
+
+        run-pma) run-pma;;
+        run-redis-admin) run-redis-admin;;
+        run-tabix) run-tabix;;
+        code-style-fixer) code-style-fixer;;
+
+        run-unit-tests) run-unit-tests "${@:2}";;
+        run-api-tests) run-api-tests "${@:2}";;
+        run-acceptance-tests) run-acceptance-tests "${@:2}";;
+        run-integration-tests) run-integration-tests "${@:2}";;
+        run-openstack-tests) run-openstack-tests ${2-} ${3-};;
+
+        gitlab_runner_up) gitlab_runner_up "${2:-}";;
+
+        blackfire) blackfire "${@:2}";;
+        run-prometheus) run-prometheus;;
+        fill-online-models-list) fill_online_models_list;;
+        xdebug-off) xdebug_off ${2-};;
+        xdebug-on) xdebug_on ${2-};;
+        generate-apidoc) generate_apidoc;;
+
+        find-flaky-test) find-flaky-test ${2-};;
+
+        proxy) proxy "${2:-}";;
+
+        *) usage;;
+    esac
+}
+
+usage() {
+    local cmd_name="  %-30s"
+    local cmd_desc="%-s\n"
+
+    echo "Usage: $0 COMMAND" >&2
+    echo
+    echo "Commands:"
+    printf "${cmd_name} ${cmd_desc}" "up" "Start stripchat containers"
+    printf "${cmd_name} ${cmd_desc}" "down" "Stop and remove stripchat containers"
+    printf "${cmd_name} ${cmd_desc}" "restart" "Restart stripchat containers"
+
+    printf "${cmd_name} ${cmd_desc}" "acceptance-up" "Start stripchat + acceptance containers locally"
+    printf "${cmd_name} ${cmd_desc}" "acceptance-down" "Stop and remove stripchat + acceptance containers locally"
+    printf "${cmd_name} ${cmd_desc}" "openstack-up [suite]" "Start stripchat + acceptance containers on Openstack"
+    printf "${cmd_name} ${cmd_desc}" "openstack-down" "Stop and remove stripchat + acceptance containers on Openstack"
+
+    printf "${cmd_name} ${cmd_desc}" "composer" "Install php packages"
+    printf "${cmd_name} ${cmd_desc}" "frontend-build" "Build static with assets for frontend in prod mode"
+    printf "${cmd_name} ${cmd_desc}" "frontend-build-acceptance" "Build static with assets for acceptance tests"
+    printf "${cmd_name} ${cmd_desc}" "frontend-build-acceptance-new" "Download front static with assets for acceptance tests"
+    printf "${cmd_name} ${cmd_desc}" "admin-frontend-build-acceptance" "Download admin static with assets for acceptance tests"
+    printf "${cmd_name} ${cmd_desc}" "frontend-build-with-legacy" "Build static with assets for frontend in prod mode with legacy browser support"
+    printf "${cmd_name} ${cmd_desc}" "frontend-admin-build" "Build static with assets for frontend admin in prod mode"
+    printf "${cmd_name} ${cmd_desc}" "docs" "Build /docs page assets"
+    printf "${cmd_name} ${cmd_desc}" "generate-apidoc" "Generates API documentation"
+    printf "${cmd_name} ${cmd_desc}" "rebuild" "Rebuild related docker images"
+
+    printf "${cmd_name} ${cmd_desc}" "migrations" "Execute sql migrations"
+    printf "${cmd_name} ${cmd_desc}" "fixtures" "Generate fixture users"
+
+    echo
+    echo "Workers management:"
+    printf "${cmd_name} ${cmd_desc}" "worker-start [name]" "Start worker"
+    printf "${cmd_name} ${cmd_desc}" "worker-stop [name]" "Stop worker"
+    printf "${cmd_name} ${cmd_desc}" "worker-restart [name]" "Restart worker"
+    printf "${cmd_name} ${cmd_desc}" "min-workers-suite" "Start minimal workers suite"
+    printf "${cmd_name} ${cmd_desc}" "start-workers" "Start one container with full workers set (don't recommended)"
+    printf "${cmd_name} ${cmd_desc}" "scheduler" "Start scheduler"
+    echo
+    echo "Helpful services:"
+    printf "${cmd_name} ${cmd_desc}" "run-pma" "Run phpMyAdmin on http://localhost:3001"
+    printf "${cmd_name} ${cmd_desc}" "run-redis-admin" "Run phpRedisAdmin on http://localhost:3002"
+    printf "${cmd_name} ${cmd_desc}" "run-tabix" "Run Tabix (ClickHouse client) on http://localhost:3003"
+    printf "${cmd_name} ${cmd_desc}" "code-style-fixer" "Run code style fixer"
+    printf "${cmd_name} ${cmd_desc}" "xdebug-on" "Enables xdebug inside app"
+    printf "${cmd_name} ${cmd_desc}" "xdebug-off" "Disables xdebug inside app"
+    printf "${cmd_name} ${cmd_desc}" "proxy [url]" "Override API Backend"
+    echo
+    echo "Testing:"
+    printf "${cmd_name} ${cmd_desc}" "run-unit-tests [path]" "Run unit tests"
+    printf "${cmd_name} ${cmd_desc}" "run-api-tests [path]" "Run API tests"
+    printf "${cmd_name} ${cmd_desc}" "run-acceptance-tests [path]" "Run acceptance tests"
+    printf "${cmd_name} ${cmd_desc}" "run-integration-tests [path]" "Run integration tests"
+    printf "${cmd_name} ${cmd_desc}" "run-openstack-tests [suite] [envfile]" "Run acceptance/validation tests on Openstack"
+
+    printf "${cmd_name} ${cmd_desc}" "blackfire" "Profile php CLI script or HTTP request using blackfire profiler"
+    printf "${cmd_name} ${cmd_desc}" "run-prometheus" "Run prometheus"
+    printf "${cmd_name} ${cmd_desc}" "fill-online-models-list" "Fill online models list"
+
+    echo
+    start_message
+}
+
+network_create() {
+    # TODO: imperfect way as if network create fails then we returns true
+    # https://stackoverflow.com/questions/48643466/docker-create-network-should-ignore-existing-network#comment96939494_48643576
+    # Check if network exists via network ls | grep instead https://stackoverflow.com/a/66454720/3178453
+    docker network create --driver=bridge --subnet="$DOCKER_NETWORK_SUBNET" "$DOCKER_NETWORK_NAME" || true
+}
+
+up() {
+#    docker login registry.stripdev.com -u $GITLAB_USER -p $GITLAB_PWD
+
+    network_create
+
+    case "${1:-}" in
+        stripchat) stripchat_up;;
+        paymentico) paymentico_up;;
+
+        *) paymentico_up; stripchat_up;;
+    esac
+}
+
+down() {
+    case "${1:-}" in
+        stripchat) stripchat_down;;
+        paymentico) paymentico_down;;
+
+        *) paymentico_down; stripchat_down;;
+    esac
+
+    docker network rm $DOCKER_NETWORK_NAME || true
+}
+
+restart() {
+    down "$@"
+    up "$@"
+}
+
+stripchat_up() {
+    # run composer if vendor does not exist
+    if [[ ! -d "vendor" ]]; then
+        composer
+    fi
+
+    # run frontend-build if frontend does not exist
+    if [[ ! -d "frontend/node_modules" ]]; then
+        frontend-build
+    fi
+
+    cp -n docker-app.env.sample docker-app.env || true
+    cp -n docker-compose.override.yml.sample docker-compose.override.yml || true
+
+    local compose_params=""
+
+    $DOCKER_COMPOSE_DEV up -d ${compose_params}
+
+    migrations
+
+    add-pre-commit
+
+    start_message
+}
+
+stripchat_down() {
+    $DOCKER_COMPOSE_DEV down || true
+}
+
+gitlab_runner_up() {
+    network_create
+
+    $DOCKER_COMPOSE_GITLAB_TEST up -d
+
+    paymentico_up
+    set +o errexit # disable errexit
+
+    # Override docker compose file
+    # with -T (important argument to run test inside gitlab runner)
+    migrations "$DOCKER_COMPOSE_GITLAB_TEST exec -T app"
+}
+
+paymentico_up() {
+    $DOCKER_COMPOSE_PAYMENTICO up -d
+    echo "[ * ] Paymentico STARTED"
+}
+
+paymentico_down() {
+    $DOCKER_COMPOSE_PAYMENTICO down || true
+    echo "[ * ] Remove 'paymentico_data' volume"
+    docker volume rm paymentico_data -f || true
+    echo "[ * ] Paymentico STOPPED"
+}
+
+paymentico_drop_storage_volumes() {
+    paymentico_down
+    echo "[ * ] Remove 'paymentico storage (mysql, redis) volumes"
+    docker volume rm paymentico_mysql -f || true
+    docker volume rm paymentico_redis -f || true
+    echo "[ * ] Paymentico STOPPED"
+    paymentico_up
+}
+
+rebuild() {
+    $DOCKER_COMPOSE_DEV build --pull
+}
+
+frontend-build() {
+    echo "Build MODERN frontend assets and static"
+
+    cd frontend
+    ES_MODE=modern yarn build
+    cd ..
+}
+
+add-pre-commit() {
+    echo "Add pre-commit hook"
+
+    mkdir -p .git/hooks
+    cp pre-commit.sh .git/hooks/pre-commit
+    chmod +x .git/hooks/pre-commit
+}
+
+frontend-build-acceptance-new() {
+    echo ":: Download frontend assets and static for acceptance tests ::"
+    BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    JOB_ID=$(python3 gitlab/acceptance/gitlab_api/job_id_finder.py ${BRANCH} build_front)
+    echo Job id ${JOB_ID}
+    curl --location -o artifact.tgz -H "PRIVATE-TOKEN: gRaCYpUK17ZocFxrSogF" https://gitlab.stripchat.dev/api/v4/projects/102/jobs/${JOB_ID}/artifacts/artifacts/Frontend.tgz
+    echo ':: Extract files ::'
+    tar -zxf artifact.tgz -C .
+    echo ':: Remove artifacts ::'
+    rm -rf artifact.tgz
+    echo ':: Done ::'
+}
+
+frontend-admin-build-acceptance() {
+    echo ":: Download frontend admin assets and static for acceptance tests ::"
+    BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    JOB_ID=$(python3 gitlab/acceptance/gitlab_api/job_id_finder.py ${BRANCH} build_frontend_admin)
+    echo Job id ${JOB_ID}
+    curl --location -o artifact.tgz -H "PRIVATE-TOKEN: gRaCYpUK17ZocFxrSogF" https://gitlab.stripchat.dev/api/v4/projects/102/jobs/${JOB_ID}/artifacts/artifacts/Frontend_admin.tgz
+    echo ':: Extract files ::'
+    tar -zxf artifact.tgz -C .
+    echo ':: Remove artifacts ::'
+    rm -rf artifact.tgz
+    echo ':: Done ::'
+}
+
+frontend-build-acceptance() {
+    echo ":: Build MODERN frontend assets and static for acceptance tests ::"
+    docker run \
+      -v "$( pwd )"/frontend:/root/frontend \
+      -v "$( pwd )"/ssr:/root/ssr \
+      -v "$( pwd )"/static:/root/static \
+      -v "$( pwd )"/i18n:/root/i18n \
+      -v "$( pwd )"/shared:/root/shared \
+      -v ~/.ssh:/root/.ssh:ro \
+      --rm \
+      -w '/root/frontend' \
+      --env ES_MODE=modern \
+      node:14 \
+      yarn build
+}
+
+frontend-build-with-legacy() {
+    echo "Build frontend assets and static with legacy browsers support"
+
+    cd frontend
+    THEME=dark yarn build
+    cd ..
+}
+
+frontend-admin-build() {
+    echo "Build frontend admin assets and static"
+
+    cd frontend-admin
+    yarn build
+    cd ..
+}
+
+find-flaky-test() {
+    python3 gitlab/acceptance/gitlab_api/flaky_test_finder.py ${1-}
+}
+
+composer() {
+    docker run -t --name composer --rm \
+    -v "$( pwd )":/app:rw \
+    composer install --ignore-platform-reqs
+}
+
+migrations() {
+    set +o errexit # disable errexit
+    $DOCKER_COMPOSE_PAYMENTICO exec app ./cli.php migration:migrate
+
+    # use argument to change docker compose file or executing options
+    local DOCKER_COMPOSE_PROJECT_EXEC="${1:-$DOCKER_COMPOSE_DEV exec app}"
+
+    $DOCKER_COMPOSE_PROJECT_EXEC \
+    /bin/bash -c "/var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db.stripchat.local:3306 -- \
+    /var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db-history.stripchat.local:3306 -- \
+    /var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db-test.stripchat.local:3306 -- \
+    /var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db-feed.stripchat.local:3306 -- \
+    php /var/www/html/stripchat migrations:migrate && \
+    /var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db-log.stripchat.local:3306 -- \
+    php /var/www/html/stripchat migrations:log && \
+    php /var/www/html/stripchat migrations:requests && \
+    php /var/www/html/stripchat migrations:feeds && \
+    php /var/www/html/stripchat ml:migrations:migrate && \
+    php /var/www/html/stripchat clickhouse:migrations:migrate && \
+    /var/www/html/docker/_utils/wait-for-it.sh -t 90 -s elasticsearch.stripchat.local:9200 -- \
+    php /var/www/html/stripchat elasticsearch:migrations:reindex"
+}
+
+fixtures() {
+    echo "[ * ] Drop paymentico data volumes first"
+    paymentico_drop_storage_volumes
+    $DOCKER_COMPOSE_DEV run --rm \
+      -v /dev/null:/usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+      --name stripchat-fixtures app php /var/www/html/stripchat fixture:make -d memory_limit=5G
+}
+
+worker-start() {
+    _check_worker_name "${1}"
+    local worker_name="${1}"
+
+    # docker-compose run does not apply restart policy from docker-compose.yml so we update it manually
+    $DOCKER_COMPOSE_CURRENT run --name stripchat-worker-"${worker_name//:/-}"-$(date +%s) -d app \
+        php /var/www/html/stripchat run:worker "${worker_name}" \
+        | xargs docker update --restart unless-stopped \
+        || true
+}
+
+worker-stop() {
+    _check_worker_name "${1}"
+    local worker_name="${1//:/-}"
+
+    docker rm -f $( docker ps -qaf name=stripchat-worker-"${worker_name}" ) 2>/dev/null || true
+}
+
+worker-restart() {
+    _check_worker_name "${1:-}"
+
+    worker-stop "${1}"
+    worker-start "${1}"
+}
+
+scheduler() {
+    docker rm -f stripchat-scheduler 2>/dev/null || true
+
+    $DOCKER_COMPOSE_CURRENT run --rm --name stripchat-scheduler -d app \
+        php /var/www/html/stripchat run:scheduler 2>/dev/null  || true
+}
+
+min-workers-suite() {
+    # restart scheduler
+    scheduler
+    # stop all workers
+    worker-stop .
+    # start workers in parallel by 5
+    worker-start billing:async:transaction:completed &
+    worker-start billing:register &
+    worker-start cache:online &
+    worker-start comet:auth:update &
+    worker-start comet:message &
+    wait
+    worker-start image:thumb &
+    worker-start mail:send &
+    worker-start record:create &
+    worker-start send:email:verification &
+    worker-start show:viewer:update &
+    wait
+    worker-start user:update &
+    worker-start users:search:update &
+    worker-start show:viewer:update &
+    worker-start search:update &
+    worker-start chat:add &
+    wait
+    worker-start chat:filter &
+    worker-start king:update &
+    worker-start billing:update:entity &
+    worker-start model:tags:update:init &
+    worker-start model:tags:update:calc &
+    wait
+    worker-start model:tags:update &
+    worker-start models:offline:streamSpecific:cache &
+    worker-start models:offline:streamSpecific:cache:init &
+    worker-start model:goals:next:announce &
+    worker-start users:experience:update &
+    wait
+    worker-start users:ranking:update0 &
+    worker-start users:ranking:update1 &
+    worker-start users:ranking:update2 &
+    worker-start users:ranking:update3 &
+    worker-start users:ranking:update4 &
+    wait
+    worker-start users:ranking:update5 &
+    worker-start modelsFavorites:update &
+    worker-start users:feeds:updateLastViewedEvent &
+    worker-start likes:counter:update &
+    worker-start usersFavorites:update &
+    wait
+    worker-start models:events:update &
+    worker-start models:events:comet:sendNewEventMessage &
+    worker-start models:events:search:index:update &
+    worker-start models:events:accessMode:update &
+    worker-start models:events:access:update &
+    wait
+    worker-start models:events:view:update &
+    worker-start models:events:score:update &
+    worker-start models:events:guestScore:update &
+    worker-start models:events:userScore:update &
+    worker-start epicGoal:token:update &
+    wait
+    worker-start tags:models:update &
+    worker-start privateMessages:video:create &
+    worker-start update:pm:counterpart:cache &
+    worker-start users:discoveredModels:update &
+    wait
+}
+
+start-all-workers() {
+    $DOCKER_COMPOSE_DEV run --rm --name stripchat-workers -d app \
+	bash -c "/var/www/html/stripchat supervisor:configure workers && /usr/bin/supervisord -n"
+}
+
+code-style-fixer() {
+    $DOCKER_COMPOSE_DEV run --name code-style-fixer --rm \
+	-v /dev/null:/usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+	app bash -c "vendor/bin/php-cs-fixer fix; vendor/bin/phpcbf -n;"
+}
+
+run-pma() {
+    local port=3001
+    local existsContainer="$( docker ps -qaf name=phpmyadmin )"
+    if [[ "${existsContainer}" ]]; then
+        docker rm -f "${existsContainer}" > /dev/null
+    fi
+
+    docker run --name phpmyadmin --rm --network="${DOCKER_NETWORK_NAME}" -d \
+        -e PMA_ARBITRARY=1 \
+        -e PMA_HOSTS=db.stripchat.local,db-log.stripchat.local,db-history.stripchat.local,db-test.stripchat.local,db-feed.stripchat.local,db-ml.stripchat.local \
+        -e PMA_USER=root \
+        -e PMA_PASSWORD=toor \
+        -p "${port}":80 \
+        phpmyadmin/phpmyadmin > /dev/null
+
+    echo "phpMyAdmin available on http://localhost:${port}"
+}
+
+run-redis-admin() {
+    local port=3002
+    local existsContainer="$( docker ps -qaf name=phpredisadmin )"
+    if [[ "${existsContainer}" ]]; then
+        docker rm -f "${existsContainer}" > /dev/null
+    fi
+
+    docker run --name phpredisadmin --rm --network="${DOCKER_NETWORK_NAME}" -d \
+        -v "$( pwd )"/docker/phpredisadmin/config.inc.php:/src/app/includes/config.inc.php \
+        -p "${port}":80 \
+        actency/docker-phpredisadmin > /dev/null
+
+        echo "phpRedisAdmin available on http://localhost:${port}"
+}
+
+run-prometheus() {
+    local existsContainer="$( docker ps -qaf name=prometheus )"
+    if [[ "${existsContainer}" ]]; then
+        docker rm -f "${existsContainer}" > /dev/null
+    fi
+
+    docker run --name prometheus --rm --network="stripchat" -d \
+        -v "$( pwd )"/docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml \
+        -p 9090:9090 \
+        prom/prometheus > /dev/null
+
+    echo "prometheus available on http://0.0.0.0:9090/targets"
+}
+
+run-tabix() {
+    local existsContainer="$( docker ps -qaf name=tabix)"
+    if [[ "${existsContainer}" ]]; then
+        docker rm -f ${existsContainer} > /dev/null
+    fi
+
+    docker run --name tabix --rm --network="${DOCKER_NETWORK_NAME}" -d \
+        -e CH_NAME=stripchat \
+        -e CH_HOST=172.16.2.106:8123 \
+        -e CH_LOGIN=default \
+        -p 3003:80 \
+        spoonest/clickhouse-tabix-web-client > /dev/null
+
+    echo "Tabix available on http://localhost:3003"
+}
+
+run-unit-tests() {
+    $DOCKER_COMPOSE_DEV run --rm --name unit-tests -T \
+        -v /dev/null:/usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+        app ./vendor/bin/codecept run --debug unit "$@"
+}
+
+run-api-tests() {
+    $DOCKER_COMPOSE_DEV run --rm --name api-tests -T \
+        -v /dev/null:/usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+        app ./vendor/bin/codecept run api "$@"
+}
+
+run-acceptance-tests() {
+    $DOCKER_COMPOSE_ACCEPTANCE_DEV exec -T app vendor/bin/codecept clean
+    $DOCKER_COMPOSE_ACCEPTANCE_DEV exec -T app cp .env.local .env
+    $DOCKER_COMPOSE_ACCEPTANCE_DEV exec -T app vendor/bin/codecept run acceptance $@
+}
+
+run-integration-tests() {
+    $DOCKER_COMPOSE_ACCEPTANCE_DEV exec -T app vendor/bin/codecept clean
+    $DOCKER_COMPOSE_ACCEPTANCE_DEV exec -T app cp .env.release .env
+    $DOCKER_COMPOSE_ACCEPTANCE_DEV exec -T app vendor/bin/codecept run integration $@
+}
+
+run-openstack-tests() {
+    if [[ ${1-} = 'validation' ]]; then
+        _run_openstack_integration_tests ${2-}
+    elif [[ ${1-} = 'mobile' ]]; then
+       _run_openstack_acceptance_tests hub mobile ${2-}
+    elif [[ ${1-} = 'alpha' ]]; then
+        _run_openstack_acceptance_tests hub alpha ${2-}
+    elif [[ ${1-} = 'bravo' ]]; then
+        _run_openstack_acceptance_tests hub bravo ${2-}
+    elif [[ ${1-} = 'charlie' ]]; then
+        _run_openstack_acceptance_tests hub charlie ${2-}
+    elif [[ ${1-} = 'delta' ]]; then
+        _run_openstack_acceptance_tests hub delta ${2-}
+    elif [[ ${1-} = 'echo' ]]; then
+        _run_openstack_acceptance_tests hub echo ${2-}
+    elif [[ ${1-} = 'foxtrot' ]]; then
+        _run_openstack_acceptance_tests hub foxtrot ${2-}
+    elif [[ ${1-} = 'golf' ]]; then
+        _run_openstack_acceptance_tests hub golf ${2-}
+    elif [[ ${1-} = 'hotel' ]]; then
+        _run_openstack_acceptance_tests hub hotel ${2-}
+    elif [[ ${1-} = 'india' ]]; then
+        _run_openstack_acceptance_tests hub india ${2-}
+    else
+        echo "Unknown argument passed to $0: ${1-}"
+        exit 1
+    fi
+}
+
+_run_openstack_acceptance_tests() {
+    add_host_entries_from=tests/hostsEntries
+    add_host_entries_to=tests/acceptance.suite.yml
+
+    if [[ $2 = 'mobile' ]]; then
+        add_host_entries_to=tests/mobile.suite.yml
+    fi
+
+    echo ':: ip value ::'
+    export IP=$(ip address show dev eth0 scope global | awk '/inet / {split($2,var,"/"); print var[1]}')
+    echo $IP
+
+    if [[ ${IP-} && -e $add_host_entries_from && -e $add_host_entries_to ]]; then
+        echo "Adding /etc/hosts entries to browser capabilities into $add_host_entries_to"
+
+        sed "/#.*hostsEntries:/r $add_host_entries_from" $add_host_entries_to | sed "s/\${IP}/$IP/" > /tmp/edited.yml &&
+            mv /tmp/edited.yml $add_host_entries_to
+
+        echo 'Added successfully'
+    fi
+
+    $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app cp .env.local .env
+    $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app vendor/bin/codecept build
+
+    if [[ $2 = 'mobile' ]]; then
+        echo ':: mobile suite started::'
+        $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app vendor/bin/codecept run mobile --env=hub --html=result.html --xml=result.xml && touch success || touch failed
+    else
+        echo ':: acceptance suite started ::'
+        sleep 15
+        _run_parallel_tests $2 || true
+        _prepare_failed_tests_to_rerun || true
+    fi
+
+    # echo ':: upload results to allure ::'
+    # allurectl upload --token a9c4010c-1d52-458b-b551-6c009d9b9faf --endpoint https://allure.stripcash.tech --project-id 4 --launch-id $3 tests/_output/allure-results
+
+    ls success && exit 0 || exit 1
+}
+
+_run_parallel_tests() {
+  $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app vendor/bin/codecept run acceptance --group=$11 --env=hub --html=result_1.html --xml=result_1.xml --override 'extensions: config: Codeception\Extension\RunFailed: fail-group: failed_1' &
+  P1=$!
+  $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app vendor/bin/codecept run acceptance --group=$12 --env=hub --html=result_2.html --xml=result_2.xml --override 'extensions: config: Codeception\Extension\RunFailed: fail-group: failed_2' &
+  P2=$!
+  $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app vendor/bin/codecept run acceptance --group=$13 --env=hub --html=result_3.html --xml=result_3.xml --override 'extensions: config: Codeception\Extension\RunFailed: fail-group: failed_3' &
+  P3=$!
+  $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app vendor/bin/codecept run acceptance --group=$14 --env=hub --html=result_4.html --xml=result_4.xml --override 'extensions: config: Codeception\Extension\RunFailed: fail-group: failed_4' &
+  P4=$!
+  $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app vendor/bin/codecept run acceptance --group=$15 --env=hub --html=result_5.html --xml=result_5.xml --override 'extensions: config: Codeception\Extension\RunFailed: fail-group: failed_5' &
+  P5=$!
+  $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app vendor/bin/codecept run acceptance --group=$16 --env=hub --html=result_6.html --xml=result_6.xml --override 'extensions: config: Codeception\Extension\RunFailed: fail-group: failed_6' &
+  P6=$!
+  $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK exec -T app vendor/bin/codecept run acceptance --group=$17 --env=hub --html=result_7.html --xml=result_7.xml --override 'extensions: config: Codeception\Extension\RunFailed: fail-group: failed_7' &
+  P7=$!
+
+  wait $P1 $P2 $P3 $P4 $P5 $P6 $P7
+}
+
+_prepare_failed_tests_to_rerun() {
+    echo 'Prepare failed tests to rerun'
+
+    if [ $(ls -1 tests/_output | wc -l) -eq 0 ]; then
+        echo 'Directory tests/_output is empty.'
+        touch failed
+        return 0
+    fi
+
+    if [ $(ls -1 tests/_output | grep failed | wc -l) -eq 0 ]; then
+        echo 'Nice! No one failed test found'
+        touch success
+        return 0
+    fi
+
+    echo 'Remove duplicates from failed tests'
+    ls -1 tests/_output | grep failed | xargs -I {} sh -c "sort -u tests/_output/{} -o tests/_output/{}"
+    touch failed
+}
+
+_run_openstack_integration_tests() {
+    suite=validation
+
+    if [[ ${1-} ]]; then
+        $DOCKER_COMPOSE_INTEGRATION_OPENSTACK exec -T app cp $1 .env
+    else
+        echo "Usage: $0 run-openstack-tests $suite .env.preprod"
+        exit 1
+    fi
+
+    echo ':: run validation tests ::'
+    $DOCKER_COMPOSE_INTEGRATION_OPENSTACK exec -T app vendor/bin/codecept build
+    $DOCKER_COMPOSE_INTEGRATION_OPENSTACK exec -T app vendor/bin/codecept run $suite --html result.html --xml result.xml --env=hub && touch success || touch failed
+
+    ls success && exit 0 || exit 1
+}
+
+blackfire() {
+    if [[ ! "$( docker ps -qf name=blackfire )" ]]; then
+        echo "Starting Blackfire Server..."
+        docker run --name="blackfire" --rm --network="${DOCKER_NETWORK_NAME}" -d \
+            --env-file="$( dirname "$0" )"/../docker-app.env \
+            blackfire/blackfire
+    fi
+
+    $DOCKER_COMPOSE_DEV run --rm -T \
+        -v /dev/null:/usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+        app blackfire "$@"
+}
+
+_check_worker_name() {
+    if [[ ! "${1}" ]]; then
+        echo "Missed worker name"
+        echo "Usage: $0 ${FUNCNAME[1]} [name]"
+        exit 1
+    fi
+}
+
+openstack-up() {
+    if [[ ${1-} = 'validation' ]]; then
+        _openstack_integration_up
+    elif [[ ${1-} = 'alpha' ||  ${1-} = 'bravo' ||  ${1-} = 'charlie' ||  ${1-} = 'delta' ||  ${1-} = 'echo' || ${1-} = 'foxtrot' || ${1-} = 'golf' ||  ${1-} = 'hotel' ||  ${1-} = 'india' ||  ${1-} = 'mobile' || ${1-} = 'local' ]]; then
+        _openstack_acceptance_up ${1-}
+    else
+        echo "Unknown argument passed to $0: ${1-}"
+        exit 1
+    fi
+
+    # Log exited containers
+    exited_containers=$(docker ps -aq --filter "status=exited")
+    if [[ $exited_containers ]]; then
+        for container in $exited_containers; do
+            docker ps -af "id=$container"
+            docker logs --tail 10 $container
+        done
+    fi
+}
+
+acceptance-local-up() {
+  if [[ ${1-} = 'linux' ]]; then
+    openstack-up local
+  elif [ ${1-} = 'mac' ]; then
+    acceptance-up
+  fi
+
+  docker volume rm data_folder || true
+  docker-compose -f tests/docker-compose.selenoid.dev.yml up -d
+  docker volume rm data_folder || true
+}
+
+acceptance-local-restart() {
+  openstack-down
+  acceptance-local-up ${1-}
+}
+
+_openstack_acceptance_up() {
+    DOCKER_COMPOSE_CURRENT=$DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK
+
+    # FIXME
+    # UnixHTTPConnectionPool(host='localhost', port=None): Read timed out. (read timeout=60)
+    export COMPOSE_HTTP_TIMEOUT=180
+
+    echo ':: workaround for twitter signup ::'
+    sed -i -e 's/https/http/g' ./vendor/abraham/twitteroauth/src/TwitterOAuth.php
+
+    network_create
+
+    echo ':: up stripchat ::'
+    $DOCKER_COMPOSE_CURRENT pull -q
+    $DOCKER_COMPOSE_CURRENT up -d
+
+    docker login registry.stripchat.dev -u token-for-sc-autotest -p Q47c9zfHoQgHtJzSgiYc
+
+    paymentico_acceptance_up
+
+    echo ':: check paymentico_dev table exists ::'
+    $DOCKER_COMPOSE_CURRENT exec -T db \
+        /bin/bash -c "for i in {1..10}; do mysql -u root -h db.paymentico.dev paymentico_dev -e 'SELECT 1' && break || sleep 2; done || exit 1"
+
+    echo ':: run migrations ::'
+    $DOCKER_COMPOSE_CURRENT exec -T app \
+        /bin/bash -c "/var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db.stripchat.local:3306 -- \
+        /var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db-history.stripchat.local:3306 -- \
+        php /var/www/html/stripchat migrations:migrate --environment=dev && \
+        /var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db-log.stripchat.local:3306 -- \
+        php /var/www/html/stripchat migrations:log && \
+        php /var/www/html/stripchat migrations:requests && \
+        php /var/www/html/stripchat migrations:feeds && \
+        php /var/www/html/stripchat ml:migrations:migrate && \
+        php /var/www/html/stripchat clickhouse:migrations:migrate"
+
+    echo ':: start workers ::'
+    _acceptance_workers_up ${1-}
+
+    echo ':: Make auto increment in stripchat db ::'
+    $DOCKER_COMPOSE_CURRENT exec -T db mysql stripchat_dev -u docker -psecret -e "ALTER TABLE users AUTO_INCREMENT = 100;"
+
+    echo ':: start elasticsearch ::'
+    # docker-compose -f tests/docker-compose.elasticsearch.yml pull -q
+    docker-compose -f tests/docker-compose.elasticsearch.yml up -d
+
+    echo ':: start ssr ::'
+    docker-compose -f tests/docker-compose.ssr.openstack.yml up -d
+
+    echo ':: creating WLs ::'
+    $DOCKER_COMPOSE_CURRENT exec -T app \
+        /bin/bash -c "php /var/www/html/stripchat fixture:createWLs"
+
+    echo ':: restart comet2 ::'
+    $DOCKER_COMPOSE_ACCEPTANCE_OPENSTACK restart comet2
+
+    $DOCKER_COMPOSE_CURRENT exec -T app \
+        /bin/bash -c "for i in {1..10}; do ./stripchat elastic:createModelsEventsIndex && break || sleep 2; done || exit 1"
+
+    echo ':: reindex elasticsearch ::'
+    $DOCKER_COMPOSE_CURRENT exec -T app \
+        /bin/bash -c "/var/www/html/docker/_utils/wait-for-it.sh -t 90 -s elasticsearch.stripchat.local:9200"
+    $DOCKER_COMPOSE_CURRENT exec -T app ./stripchat elasticsearch:migrations:reindex
+
+    echo ':: start sleep 10 ::'
+    sleep 10
+    echo ':: finish sleep ::'
+    # echo ':: stop clickhouse ::'
+    # $DOCKER_COMPOSE_CURRENT stop clickhouse
+}
+
+_openstack_integration_up() {
+    $DOCKER_COMPOSE_INTEGRATION_OPENSTACK up -d
+}
+
+openstack-down() {
+    echo ':: stop all docker containers ::'
+    docker stop $(docker ps -a -q) || true
+
+    echo ':: remove all docker containers ::'
+    docker rm $(docker ps -a -q) || true
+}
+
+acceptance-up() {
+    DOCKER_COMPOSE_CURRENT=$DOCKER_COMPOSE_ACCEPTANCE_DEV
+
+    # FIXME
+    # UnixHTTPConnectionPool(host='localhost', port=None): Read timed out. (read timeout=60)
+    export COMPOSE_HTTP_TIMEOUT=180
+
+    sed -i -e 's/https/http/g' ./vendor/abraham/twitteroauth/src/TwitterOAuth.php
+
+    network_create
+
+    $DOCKER_COMPOSE_CURRENT pull
+    $DOCKER_COMPOSE_CURRENT up -d
+
+    paymentico_acceptance_up
+
+    echo ':: wait until paymentico db started ::'
+    $DOCKER_COMPOSE_CURRENT exec -T db \
+        /bin/bash -c "for i in {1..30}; do mysql -u root -h db.paymentico.dev paymentico_dev -e 'SELECT 1' && break || sleep 2; done"
+
+    # Migrations
+    $DOCKER_COMPOSE_CURRENT exec -T app \
+        /bin/bash -c "/var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db.stripchat.local:3306 -- \
+        /var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db-history.stripchat.local:3306 -- \
+        php /var/www/html/stripchat migrations:migrate --environment=dev && \
+        /var/www/html/docker/_utils/wait-for-it.sh -t 90 -s db-log.stripchat.local:3306 -- \
+        php /var/www/html/stripchat migrations:log && \
+        php /var/www/html/stripchat migrations:requests && \
+        php /var/www/html/stripchat migrations:feeds && \
+        php /var/www/html/stripchat ml:migrations:migrate && \
+        php /var/www/html/stripchat clickhouse:migrations:migrate"
+
+    echo 'Creating WLs...'
+    $DOCKER_COMPOSE_CURRENT exec -T app \
+        /bin/bash -c "php /var/www/html/stripchat fixture:createWLs"
+    echo 'Done!'
+
+    $DOCKER_COMPOSE_CURRENT exec -T db mysql stripchat_dev -u docker -psecret -e "ALTER TABLE users AUTO_INCREMENT = 100000000;"
+
+    _acceptance_workers_down
+    _acceptance_workers_up 'local'
+
+    echo ':: start ssr ::'
+    docker-compose -f tests/docker-compose.ssr.dev.yml up -d
+
+    echo ':: start elasticsearch ::'
+    docker-compose -f tests/docker-compose.elasticsearch.yml up -d
+
+    echo ':: reindex elasticsearch ::'
+    $DOCKER_COMPOSE_CURRENT exec -T app \
+        /bin/bash -c "/var/www/html/docker/_utils/wait-for-it.sh -t 90 -s elasticsearch.stripchat.local:9200"
+    $DOCKER_COMPOSE_CURRENT exec -T app ./stripchat elasticsearch:migrations:reindex
+}
+
+paymentico_acceptance_up() {
+    echo ':: remove paymentico volumes ::'
+    docker volume rm paymentico_data -f || true
+    docker volume rm paymentico_mysql -f || true
+    docker volume rm paymentico_redis -f || true
+    docker volume rm paymentico_root -f || true
+
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO pull
+
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO up -d db
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO exec -T db \
+        /bin/bash -c "echo :: migrations :: run as background task && \
+        /root/wait-for-it.sh -t 90 db.paymentico.dev:3306 && \
+        echo :: create \`paymentico_dev\` database, grant access && \
+        mysql < /root/db.paymentico_dev.sql && \
+        echo :: migrations :: completed"
+
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO up -d redis
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO up -d app
+
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO exec -T app \
+        /bin/bash -c "echo :: run migrations on \`paymentico_dev\` database :: &&
+        echo :: wait for database is available :: &&
+        ./docker/wait-for-it.sh -t 90 db.paymentico.dev:3306"
+
+    echo ':: wait until paymentico db started ::'
+    $DOCKER_COMPOSE_CURRENT exec -T db \
+        /bin/bash -c "for i in {1..30}; do mysql -u root -h db.paymentico.dev paymentico_dev -e 'SELECT 1' && break || sleep 2; done"
+
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO exec -T app \
+        /bin/bash -c "echo :: migrations:migrate :: dev &&
+        ./cli.php migrations:migrate &&
+        echo :: change env file :: &&
+        sed -i -e 's/#MODULES_COMMON_IP_WHITELIST/MODULES_COMMON_IP_WHITELIST/g' ./cfg/environments/development.env &&
+        sed -i -e 's/MODULES_COMMON_IP_WHITELIST/#MODULES_COMMON_IP_WHITELIST/g' ./cfg/environments/development.env"
+
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO up -d nginx
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO up -d workers
+
+    echo "[ * ] Paymentico STARTED"
+}
+
+paymentico_acceptance_down() {
+    $DOCKER_COMPOSE_ACCEPTANCE_PAYMENTICO down || true
+    echo "[ * ] Paymentico STOPPED"
+}
+
+acceptance-down() {
+    _acceptance_workers_down
+
+    $DOCKER_COMPOSE_ACCEPTANCE_DEV down || true
+
+    paymentico_acceptance_down
+
+    echo ':: stop elasticsearch ::'
+    docker-compose -f tests/docker-compose.elasticsearch.yml down
+
+    echo ':: stop ssr ::'
+    docker-compose -f tests/docker-compose.ssr.dev.yml down
+}
+
+_acceptance_workers_up() {
+    if [[ ${1-} = 'alpha' || ${1-} = 'local' ]]; then
+        echo ':: alpha group workers ::'
+        worker-start photos:moderate &
+        worker-start epicGoal:token:update &
+        worker-start broadcaster:update:stripScoreInit &
+        wait
+        worker-start broadcaster:update:stripScore &
+        worker-start model:rating:private:recalc &
+        worker-start gdpr:user:deletion &
+        wait
+        worker-start models:offline:streamSpecific:cache &
+        worker-start models:offline:streamSpecific:cache:init &
+        wait
+    fi
+
+    if [[ ${1-} = 'bravo' || ${1-} = 'local' ]]; then
+        echo ':: bravo group workers ::'
+        worker-start antispam:check &
+        worker-start search:update &
+        worker-start referral:add &
+        wait
+        worker-start notification:push &
+        wait
+    fi
+
+    if [[ ${1-} = 'charlie' || ${1-} = 'india' || ${1-} = 'local' ]]; then
+        echo ':: charlie/india group workers ::'
+        worker-start photos:moderate &
+        worker-start likes:counter:update &
+        worker-start models:events:update &
+        wait
+        worker-start models:events:search:index:update &
+        worker-start users:feeds:updateLastViewedEvent &
+        worker-start user:favorites:sort:init &
+        wait
+        worker-start user:favorites:sort &
+        worker-start clickhouse:flush &
+        worker-start models:events:guestScore:update &
+        wait
+        worker-start models:events:accessMode:update &
+        worker-start models:events:userScore:update &
+        worker-start models:events:access:update &
+        wait
+    fi
+
+    if [[ ${1-} = 'delta' || ${1-} = 'local' ]]; then
+        echo ':: delta group workers ::'
+        worker-start video:process:start &
+        worker-start video:task:run &
+        worker-start users:ml:abtest:group:update &
+        wait
+        worker-start users:discoveredModels:update &
+        wait
+    fi
+
+    if [[ ${1-} = 'echo' || ${1-} = 'local' ]]; then
+        echo ':: echo group workers ::'
+        worker-start update:model:king &
+        wait
+    fi
+
+    if [[ ${1-} = 'foxtrot' || ${1-} = 'mobile' || ${1-} = 'local' ]]; then
+        echo ':: foxtrot group workers ::'
+        worker-start cache:tag:views:count &
+        worker-start tag:mixed:aggregate &
+        worker-start tag:views:count &
+        wait
+        worker-start watch:history:add &
+        wait
+    fi
+
+    if [[ ${1-} = 'golf' || ${1-} = 'local' ]]; then
+        echo ':: golf group workers ::'
+        worker-start freshdesk:contact:update &
+        worker-start models:events:update &
+        worker-start users:search:update &
+        wait
+        worker-start models:events:search:index:update &
+        worker-start user:content:delete &
+        worker-start search:update &
+        wait
+    fi
+
+    if [[ ${1-} = 'india' || ${1-} = 'local' ]]; then
+        echo ':: india group workers ::'
+        worker-start models:events:tips:update &
+        wait
+    fi
+
+    echo ':: common group workers ::'
+    worker-start amplitude:event &
+    worker-start king:update &
+    worker-start mail:send &
+    wait
+    worker-start send:email:verification &
+    worker-start billing:async:transaction:completed &
+    worker-start chat:add &
+    wait
+    worker-start comet:auth:update &
+    worker-start comet:message &
+    worker-start image:thumb &
+    wait
+    worker-start record:create &
+    worker-start show:viewer:update &
+    worker-start user:update &
+    wait
+    worker-start cache:online &
+    worker-start billing:update:entity &
+    worker-start users:experience:update &
+    wait
+    worker-start model:tags:update:init &
+    worker-start model:tags:update:calc &
+    worker-start model:tags:update &
+    wait
+    worker-start tags:models:update &
+    worker-start users:ranking:update0 &
+    worker-start users:ranking:update1 &
+    wait
+    worker-start users:ranking:update2 &
+    worker-start users:ranking:update3 &
+    worker-start users:ranking:update4 &
+    wait
+    worker-start users:ranking:update5 &
+    worker-start usersFavorites:update &
+    wait
+}
+
+_acceptance_workers_down() {
+    worker-stop amplitude:event &
+    worker-stop antispam:check  &
+    worker-stop billing:async:transaction:completed &
+    worker-stop chat:add &
+    worker-stop comet:auth:update &
+    worker-stop comet:message &
+    worker-stop epicGoal:token:update &
+    worker-stop image:thumb &
+    worker-stop mail:send &
+    worker-stop record:create &
+    worker-stop search:update &
+    worker-stop send:email:verification &
+    worker-stop show:viewer:update &
+    worker-stop user:update &
+    worker-stop users:ranking:update0 &
+    worker-stop users:ranking:update1 &
+    worker-stop users:ranking:update2 &
+    worker-stop users:ranking:update3 &
+    worker-stop users:ranking:update4 &
+    worker-stop users:ranking:update5 &
+    worker-stop cache:online &
+    worker-stop watch:history:add &
+    worker-stop tag:views:count &
+    worker-stop cache:tag:views:count &
+    worker-stop tag:mixed:aggregate &
+    worker-stop king:update &
+    worker-stop ml:import:user:data &
+    worker-stop photos:moderate &
+    worker-stop referral:add &
+    worker-stop billing:update:entity &
+    worker-stop broadcaster:update:stripScoreInit &
+    worker-stop broadcaster:update:stripScore &
+    worker-stop model:rating:private:recalc &
+    worker-stop likes:counter:update &
+    worker-stop models:events:update &
+    worker-stop usersFavorites:update &
+    worker-stop modelsFavorites:update &
+    worker-stop models:events:search:index:update &
+    worker-stop freshdesk:contact:update &
+    worker-stop users:experience:update &
+    worker-stop users:ml:abtest:group:update &
+    worker-stop model:tags:update:init &
+    worker-stop model:tags:update:calc &
+    worker-stop model:tags:update &
+    worker-stop tags:models:update &
+    worker-stop video:process:start &
+    worker-stop video:task:run &
+    worker-stop user:content:delete &
+    worker-stop notification:push &
+    worker-stop models:events:guestScore:update &
+    worker-stop models:events:accessMode:update &
+    worker-stop models:events:access:update &
+    worker-stop gdpr:user:deletion &
+    worker-stop models:events:userScore:update &
+    worker-stop user:favorites:sort:init &
+    worker-stop user:favorites:sort &
+    worker-stop clickhouse:flush &
+    worker-stop update:model:king &
+    worker-stop models:offline:streamSpecific:cache &
+    worker-stop models:offline:streamSpecific:cache:init &
+    worker-stop users:discoveredModels:update &
+    worker-stop models:events:tips:update &
+    wait
+}
+
+fill_online_models_list() {
+  docker-compose exec -T redis-cache redis-cli -x set broadcasters:online:models:count:0:0 < docker/helpers/cache-keys/broadcasters-online-models-count.txt
+  docker-compose exec -T redis-cache redis-cli -x set broadcasters:online:models:count:1:1 < docker/helpers/cache-keys/broadcasters-online-models-count.txt
+  docker-compose exec -T redis-cache redis-cli -x set broadcasters:online:models:count:2:2 < docker/helpers/cache-keys/broadcasters-online-models-count.txt
+  docker-compose exec -T redis-cache redis-cli -x set broadcasters:online:models:0:0:compressed < docker/helpers/cache-keys/broadcasters-online-models-compressed.txt
+  docker-compose exec -T redis-cache redis-cli -x set broadcasters:online:models:1:1:compressed < docker/helpers/cache-keys/broadcasters-online-models-compressed.txt
+  docker-compose exec -T redis-cache redis-cli -x set broadcasters:online:models:2:2:compressed < docker/helpers/cache-keys/broadcasters-online-models-compressed.txt
+  docker-compose exec -T redis-cache redis-cli -x set broadcasters:online:models:meta:0:0:compressed < docker/helpers/cache-keys/broadcasters-online-models-meta-compressed.txt
+  docker-compose exec -T redis-cache redis-cli -x set broadcasters:online:models:meta:1:1:compressed < docker/helpers/cache-keys/broadcasters-online-models-meta-compressed.txt
+  docker-compose exec -T redis-cache redis-cli -x set broadcasters:online:models:meta:2:2:compressed < docker/helpers/cache-keys/broadcasters-online-models-meta-compressed.txt
+}
+
+xdebug_off() {
+  if [[ ${1-} == 'acceptance' ]]; then
+    DOCKER_COMPOSE_CURRENT='docker-compose -f tests/docker-compose.yml'
+  fi
+
+  $DOCKER_COMPOSE_CURRENT exec -T app /bin/bash -c "sed -i 's/^\([^#]\)/#\1/g' /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini && kill -USR2 1"
+}
+
+xdebug_on() {
+  if [[ ${1-} == 'acceptance' ]]; then
+    DOCKER_COMPOSE_CURRENT='docker-compose -f tests/docker-compose.yml'
+  fi
+
+  $DOCKER_COMPOSE_CURRENT exec -T app /bin/bash -c "sed -i 's/^#//g' /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini && kill -USR2 1"
+}
+
+generate_apidoc() {
+  # Uncomment this line if you have installed PHP7.4 locally
+  # php stripchat apidoc:generate > ./api/app/swagger.yaml
+  $DOCKER_COMPOSE_CURRENT run app php /var/www/html/stripchat apidoc:generate > ./api/app/swagger.yaml
+}
+
+start_message() {
+    echo "Project available by addresses:"
+    echo "Stripchat - https://stripchat.dev/"
+    echo "xHamsterLive - https://xhamsterlive.dev/, and mirror - https://xlivesex.dev/"
+    echo
+    echo "Admin panel - https://control.stripchat.dev/"
+    echo
+    echo "Mailcatcher - https://mail.stripchat.dev/"
+    echo
+    echo "Api documentation (master) - https://docs.stripchat.dev/"
+    echo "Api documentation (local) - https://docs.stripchat.dev/?url=https://stripchat.dev/swagger.yaml"
+}
+
+proxy() {
+    if [[ ! "${1}" ]]; then
+        echo "Missed proxy api"
+        echo "Usage: $0 proxy [url]"
+        exit 1
+    fi
+
+    BACKEND_OVERRIDE_API=${1#"https://"} $DOCKER_COMPOSE_CURRENT up -d --no-deps --force-recreate --build nginx
+}
+
+main "$@"
